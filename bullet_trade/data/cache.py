@@ -27,12 +27,16 @@ class CacheManager:
     ) -> None:
         self.provider_name = provider_name or "unknown"
         if cache_dir is not None:
-            self.cache_dir = cache_dir
+            configured_cache_dir = cache_dir
         elif fallback_to_env:
             base_dir = os.getenv("DATA_CACHE_DIR", "")
-            self.cache_dir = os.path.join(base_dir, self.provider_name) if base_dir else ""
+            configured_cache_dir = os.path.join(base_dir, self.provider_name) if base_dir else ""
         else:
-            self.cache_dir = ""
+            configured_cache_dir = ""
+        # 保留相对路径语义（相对当前工作目录），仅展开环境变量和用户目录。
+        # 这样 os.makedirs/open 与 pandas 的 parquet/pickle IO 会使用同一目录，
+        # 避免 ``~`` 被 pandas 展开而标准库仍按字面路径处理。
+        self.cache_dir = self._normalize_cache_dir(configured_cache_dir)
         self.enabled = bool(self.cache_dir)
         self.expire_days = int(os.getenv("JQDATA_CACHE_EXPIRE_DAYS", "1") or 1)
         self.default_df_format = os.getenv("JQDATA_CACHE_FORMAT", "parquet").lower()
@@ -40,6 +44,16 @@ class CacheManager:
         self.schema_version = os.getenv("JQDATA_CACHE_VERSION", "2")
         if self.enabled:
             os.makedirs(self.cache_dir, exist_ok=True)
+
+    @staticmethod
+    def _normalize_cache_dir(cache_dir: Optional[Any]) -> str:
+        """标准化缓存目录，但不把相对路径强制转换为绝对路径。"""
+        if cache_dir is None:
+            return ""
+        value = str(cache_dir).strip()
+        if not value:
+            return ""
+        return os.path.expanduser(os.path.expandvars(value))
 
     # -------------------------- 公共入口 --------------------------
     def cached_call(
