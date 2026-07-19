@@ -361,7 +361,7 @@ def test_backtest_limit_buy_not_filled_when_bar_price_above_limit(monkeypatch):
     clear_order_queue()
 
 
-def test_backtest_update_positions_fetches_each_security_individually(monkeypatch):
+def test_backtest_update_positions_fetches_securities_in_one_batch(monkeypatch):
     engine = BacktestEngine(initialize=_dummy_initialize, handle_data=_dummy_handle_data)
     portfolio = Portfolio(
         total_value=100000.0,
@@ -389,16 +389,20 @@ def test_backtest_update_positions_fetches_each_security_individually(monkeypatc
     def _fake_api_get_price(security, **kwargs):
         calls.append(security)
         if isinstance(security, list):
-            raise ValueError("找不到标的513100.SH")
-        if security == "513100.SH":
-            return pd.DataFrame({"close": [1.832]})
+            return pd.DataFrame(
+                {
+                    "time": [pd.Timestamp("2017-01-10")],
+                    "code": ["513100.SH"],
+                    "close": [1.832],
+                }
+            )
         raise AssertionError(f"unexpected security: {security}")
 
     monkeypatch.setattr("bullet_trade.core.engine.api_get_price", _fake_api_get_price)
 
     engine._update_positions()
 
-    assert calls == ["513100.SH"]
+    assert calls == [["513100.SH"]]
     assert position.price == 1.832
     assert position.value == pytest.approx(183.2)
     assert engine.context.portfolio.positions_value == pytest.approx(183.2)

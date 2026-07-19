@@ -215,6 +215,6 @@ helpers/bt_big_qmt_order_tags.json
 .codex/
 backtest_results/
 temp/
-data/
+/data/
 EasyXT/
 *.exe

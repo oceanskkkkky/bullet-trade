@@ -367,6 +367,7 @@ class BacktestDataSessionStats:
     errors: int = 0
     cache_bytes: int = 0
     peak_cache_bytes: int = 0
+    loaded_rows: int = 0
 
     def to_dict(self) -> Dict[str, int]:
         """
@@ -391,6 +392,7 @@ class BacktestDataSessionStats:
             "errors": self.errors,
             "cache_bytes": self.cache_bytes,
             "peak_cache_bytes": self.peak_cache_bytes,
+            "loaded_rows": self.loaded_rows,
         }
 
 
@@ -526,6 +528,16 @@ class BacktestDataSession:
             Dict[str, Any]: 包含配置、统计、QMT 下载记录和事件的 manifest。
         """
         elapsed = time.monotonic() - self.started_monotonic
+        backend_diagnostics: Dict[str, Any] = {}
+        try:
+            from .api import get_data_provider
+
+            provider = get_data_provider()
+            diagnostics = getattr(provider, "diagnostics", None)
+            if callable(diagnostics):
+                backend_diagnostics = dict(diagnostics())
+        except Exception:
+            backend_diagnostics = {}
         return {
             "enabled": self.config.enabled,
             "provider_name": self.config.provider_name,
@@ -544,6 +556,7 @@ class BacktestDataSession:
                 "qmt_require_coverage": self.config.qmt_require_coverage,
             },
             "stats": self.stats.to_dict(),
+            "data_backend": backend_diagnostics,
             "qmt_downloads": self.qmt_manifest,
             "events": self.events,
         }
@@ -698,6 +711,7 @@ class BacktestDataSession:
         )
         self._price_blocks[key] = block
         self.stats.cache_writes += 1
+        self.stats.loaded_rows += int(row_count or 0)
         self.stats.cache_bytes += bytes_used
         self.stats.peak_cache_bytes = max(self.stats.peak_cache_bytes, self.stats.cache_bytes)
         return True

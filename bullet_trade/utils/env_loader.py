@@ -178,6 +178,13 @@ def get_data_provider_config() -> dict:
             "backend": get_env("LOCAL_DATA_BACKEND", "parquet"),
             "path": get_env("LOCAL_DATA_PATH", str(Path("data") / "parquet")),
             "strict": get_env_bool("LOCAL_DATA_STRICT", True),
+            "query_mode": get_env("LOCAL_DATA_QUERY_MODE", "batch"),
+            "require_corporate_actions": get_env_bool("LOCAL_DATA_REQUIRE_CORPORATE_ACTIONS", True),
+            "require_fundamentals": get_env_bool("LOCAL_DATA_REQUIRE_FUNDAMENTALS", False),
+            "threads": get_env_int("LOCAL_DATA_DUCKDB_THREADS", 8),
+            "memory_limit": get_env("LOCAL_DATA_DUCKDB_MEMORY_LIMIT", "12GB"),
+            "temp_directory": get_env("LOCAL_DATA_DUCKDB_TEMP_DIRECTORY"),
+            "max_temp_directory_size": get_env("LOCAL_DATA_DUCKDB_MAX_TEMP_SIZE", "100GB"),
         },
         "qmt": {
             "data_dir": get_env("QMT_DATA_PATH"),

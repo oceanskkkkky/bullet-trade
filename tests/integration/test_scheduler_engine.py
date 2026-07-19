@@ -41,7 +41,9 @@ class StubProvider:
             end = pd.to_datetime(end_date)
             dates = pd.date_range(end=end, periods=count, freq=freq)
         else:
-            start = pd.to_datetime(start_date) if start_date is not None else pd.to_datetime(end_date)
+            start = (
+                pd.to_datetime(start_date) if start_date is not None else pd.to_datetime(end_date)
+            )
             end = pd.to_datetime(end_date)
             dates = pd.date_range(start=start, end=end, freq=freq)
 
@@ -80,7 +82,11 @@ class StubProvider:
 
     def get_all_securities(self, *args, **kwargs):
         return pd.DataFrame(
-            {"display_name": ["测试证券"], "start_date": ["2000-01-01"], "end_date": ["2099-12-31"]},
+            {
+                "display_name": ["测试证券"],
+                "start_date": ["2000-01-01"],
+                "end_date": ["2099-12-31"],
+            },
             index=["000001.XSHE"],
         )
 
@@ -127,6 +133,7 @@ def test_backtest_engine_daily_time_expressions(monkeypatch):
     def record(tag):
         def _inner(context):
             timeline[tag].append(context.current_dt)
+
         return _inner
 
     def every_minute(context):
@@ -193,8 +200,8 @@ def test_backtest_engine_warns_daily_every_bar_runs_every_minute(monkeypatch, ca
     assert len(hits) == 240
     assert hits[0].time() == dt.time(9, 30)
     assert hits[-1].time() == dt.time(14, 59)
-    assert "检测到 run_daily(..., time=\"every_bar\")" in caplog.text
-    assert "如只希望每天执行一次，请改用 time=\"open\" 或具体时间" in caplog.text
+    assert '检测到 run_daily(..., time="every_bar")' in caplog.text
+    assert '如只希望每天执行一次，请改用 time="open" 或具体时间' in caplog.text
 
 
 def test_backtest_engine_weekly_and_monthly(monkeypatch):
@@ -236,8 +243,7 @@ def process_initialize(context):
 
 def trade(context):
     g.trade_hits = int(getattr(g, 'trade_hits', 0) or 0) + 1
-""".strip()
-        + "\n",
+""".strip() + "\n",
         encoding="utf-8",
     )
 
@@ -251,6 +257,37 @@ def trade(context):
 
     assert getattr(g, "process_initialize_called", 0) == 1
     assert getattr(g, "trade_hits", 0) == 1
+
+
+def test_backtest_engine_runs_provider_preflight_before_simulation(monkeypatch):
+    trade_day = "2024-06-17"
+
+    class PreflightProvider(StubProvider):
+        def __init__(self, trade_days):
+            super().__init__(trade_days)
+            self.preflight_calls = []
+
+        def preflight_backtest(self, **kwargs):
+            self.preflight_calls.append(kwargs)
+            return {"passed": True}
+
+    provider = PreflightProvider([trade_day])
+    import bullet_trade.data.api as api_module
+
+    monkeypatch.setattr(api_module, "_provider", provider, raising=False)
+    monkeypatch.setattr(api_module, "_auth_attempted", True, raising=False)
+    engine = BacktestEngine(initialize=lambda context: None)
+
+    engine.run(
+        start_date=trade_day,
+        end_date=trade_day,
+        capital_base=100000,
+        frequency="minute",
+    )
+
+    assert len(provider.preflight_calls) == 1
+    assert provider.preflight_calls[0]["frequency"] == "minute"
+    assert provider.preflight_calls[0]["start_date"] == pd.Timestamp(trade_day)
 
 
 def test_backtest_engine_loads_benchmark_with_suffix_fallback(monkeypatch):

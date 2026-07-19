@@ -34,6 +34,122 @@ from bullet_trade.data.backtest_session import (
 from bullet_trade.data.providers import miniqmt
 from bullet_trade.data.providers.miniqmt import MiniQMTProvider
 
+
+class _BatchPriceProvider:
+    name = "local"
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def diagnostics(self):
+        return {"manifest_identity": "generation-a"}
+
+    def get_price(self, security, **kwargs):
+        self.calls.append((security, kwargs))
+        rows = []
+        for code, base in (("000001.XSHE", 10.0), ("000002.XSHE", 20.0)):
+            for day, offset in (("2025-01-02", 0.0), ("2025-01-03", 1.0)):
+                rows.append(
+                    {
+                        "time": pd.Timestamp(day),
+                        "code": code,
+                        "close": base + offset,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+
+def test_multi_security_arrow_block_is_generation_isolated_and_reused(monkeypatch):
+    provider = _BatchPriceProvider()
+    monkeypatch.setattr(data_api, "_provider", provider)
+    session = BacktestDataSession(
+        BacktestDataSessionConfig(
+            enabled=True,
+            price_block_cache_enabled=True,
+            max_cache_bytes=10_000_000,
+            start_date=dt.datetime(2025, 1, 2),
+            end_date=dt.datetime(2025, 1, 3),
+            provider_name="local",
+        )
+    )
+    token = set_current_backtest_data_session(session)
+    try:
+        first = data_api._try_get_multi_price_from_backtest_session(
+            securities=["000001.XSHE", "000002.XSHE"],
+            end_date=dt.datetime(2025, 1, 3, 15),
+            frequency="daily",
+            fields=["close"],
+            skip_paused=False,
+            fq="none",
+            count=1,
+            panel=False,
+            fill_paused=True,
+            force_no_engine=False,
+        )
+        second = data_api._try_get_multi_price_from_backtest_session(
+            securities=["000001.XSHE", "000002.XSHE"],
+            end_date=dt.datetime(2025, 1, 3, 15),
+            frequency="daily",
+            fields=["close"],
+            skip_paused=False,
+            fq="none",
+            count=1,
+            panel=False,
+            fill_paused=True,
+            force_no_engine=False,
+        )
+    finally:
+        reset_current_backtest_data_session(token)
+    assert len(provider.calls) == 1
+    assert first.groupby("code").size().to_dict() == {
+        "000001.XSHE": 1,
+        "000002.XSHE": 1,
+    }
+    pd.testing.assert_frame_equal(first, second)
+    assert session.stats.cache_writes == 1
+    assert session.stats.cache_hits == 1
+
+
+def test_current_data_preload_batches_and_container_is_shared(monkeypatch):
+    context = SimpleNamespace(current_dt=dt.datetime(2025, 1, 3, 15, 0), run_params={})
+    calls = []
+
+    def fake_price(**kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame(
+            [
+                {
+                    "time": pd.Timestamp("2025-01-03"),
+                    "code": "000001.XSHE",
+                    "open": 10.0,
+                    "close": 10.5,
+                    "high_limit": 11.5,
+                    "low_limit": 9.5,
+                    "paused": 0,
+                },
+                {
+                    "time": pd.Timestamp("2025-01-03"),
+                    "code": "000002.XSHE",
+                    "open": 20.0,
+                    "close": 20.5,
+                    "high_limit": 22.5,
+                    "low_limit": 18.5,
+                    "paused": 0,
+                },
+            ]
+        )
+
+    monkeypatch.setattr(data_api, "_call_provider_get_price_with_security_fallback", fake_price)
+    data_api.set_current_context(context)
+    current = data_api.get_current_data()
+    current.preload(["000001.XSHE", "000002.XSHE"])
+
+    assert data_api.get_current_data() is current
+    assert current["000001.XSHE"].last_price == pytest.approx(10.5)
+    assert current["000002.XSHE"].last_price == pytest.approx(20.5)
+    assert len(calls) == 1
+
+
 SECURITY_QMT = "000001.SZ"
 SECURITY_QMT_B = "000002.SZ"
 SECURITY_JQ = "000001.XSHE"

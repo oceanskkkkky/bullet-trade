@@ -13,7 +13,7 @@ from datetime import date as Date
 from datetime import datetime
 from datetime import time as Time
 from datetime import timedelta
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
@@ -26,6 +26,8 @@ from .backtest_session import get_current_backtest_data_session
 
 # 全局上下文，用于获取当前回测时间
 _current_context = None
+_current_data_container_key: Optional[Tuple[int, Any, bool]] = None
+_current_data_container: Optional[Any] = None
 
 # 引入可插拔数据提供者，并设置默认Provider
 from .providers.base import DataProvider
@@ -55,7 +57,15 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "rqdata"
     if lowered in ("tdx", "easytdx", "easy_tdx", "easy-tdx"):
         return "easy_tdx"
-    if lowered in ("local", "parquet", "local_parquet", "local-parquet"):
+    if lowered in (
+        "local",
+        "parquet",
+        "local_parquet",
+        "local-parquet",
+        "duckdb",
+        "local_duckdb",
+        "local-duckdb",
+    ):
         return "local"
     return lowered
 
@@ -111,6 +121,9 @@ def _create_provider(
 
         provider_cfg = dict(config.get("local", {}) or {})
         provider_cfg.update(overrides)
+        requested = str(provider_name or "").strip().lower()
+        if requested in ("duckdb", "local_duckdb", "local-duckdb"):
+            provider_cfg["backend"] = "duckdb"
         return LocalDataProvider(provider_cfg)
 
     raise ValueError(f"未知的数据提供者: {provider_name}")
@@ -123,9 +136,9 @@ def _ensure_auth():
         try:
             _provider.auth()
             _auth_attempted = True
-            _provider_auth_attempted[
-                _normalize_provider_name(getattr(_provider, "name", None))
-            ] = True
+            _provider_auth_attempted[_normalize_provider_name(getattr(_provider, "name", None))] = (
+                True
+            )
         except Exception as e:
             # 认证失败，但不设置 _auth_attempted = True
             # 这样下次调用时还会重试
@@ -231,7 +244,9 @@ def _sdk_fallback_targets(
             return candidate
 
     detail = "; ".join(attempts + errors) if (attempts or errors) else "无可用回退"
-    raise AttributeError(f"{normalized} 未实现 {method_name}，已尝试回退到同名 provider 的 SDK/客户端: {detail}")
+    raise AttributeError(
+        f"{normalized} 未实现 {method_name}，已尝试回退到同名 provider 的 SDK/客户端: {detail}"
+    )
 
 
 def _bind_sdk_fallback(provider: DataProvider, provider_name: str) -> None:
@@ -365,8 +380,10 @@ def get_data_provider(provider_name: Optional[str] = None) -> DataProvider:
 
 def set_current_context(context):
     """设置当前回测上下文"""
-    global _current_context
+    global _current_context, _current_data_container, _current_data_container_key
     _current_context = context
+    _current_data_container = None
+    _current_data_container_key = None
 
 
 def _is_live_mode() -> bool:
@@ -1208,6 +1225,119 @@ def _round_dynamic_pre_result(df: pd.DataFrame, security: str) -> pd.DataFrame:
         return df
 
 
+def _provider_dataset_identity() -> Any:
+    """Return a non-secret immutable dataset identity for cache isolation."""
+
+    diagnostics = getattr(_provider, "diagnostics", None)
+    if callable(diagnostics):
+        try:
+            value = diagnostics()
+            return (
+                value.get("manifest_identity")
+                or value.get("dataset_identity")
+                or (value.get("backend"), value.get("root"), value.get("schema_version"))
+            )
+        except Exception:
+            pass
+    return (getattr(_provider, "name", None), id(_provider))
+
+
+def _try_get_multi_price_from_backtest_session(
+    *,
+    securities: Sequence[str],
+    end_date: datetime,
+    frequency: str,
+    fields: Optional[List[str]],
+    skip_paused: bool,
+    fq: str,
+    count: int,
+    panel: bool,
+    fill_paused: bool,
+    force_no_engine: bool,
+) -> Optional[pd.DataFrame]:
+    """Serve a multi-security count window from one generation-isolated Arrow block."""
+
+    session = get_current_backtest_data_session()
+    if session is None or not session.config.price_block_cache_enabled:
+        return None
+    requested = tuple(dict.fromkeys(str(item) for item in securities))
+    if not requested:
+        return pd.DataFrame(columns=list(fields or ()))
+    session_end = session.config.end_date
+    if session_end is None:
+        return None
+    freq_key = _price_block_frequency_key(frequency)
+    block_end = _price_block_end_for_backtest_session(session_end=session_end, frequency=freq_key)
+    block_start = _price_block_start_for_backtest_session(
+        session_start=session.config.start_date,
+        request_end=end_date,
+        block_end=block_end,
+        frequency=freq_key,
+        count=count,
+    )
+    key = (
+        "multi_price_arrow_block",
+        _provider_dataset_identity(),
+        requested,
+        freq_key,
+        tuple(fields or ()),
+        bool(skip_paused),
+        fq,
+        bool(fill_paused),
+        _format_manifest_safe_date(block_start),
+        _format_manifest_safe_date(block_end),
+    )
+    cached = session.get_price_block(key)
+    if cached is None:
+        try:
+            block = _call_provider_get_price_with_security_fallback(
+                security=list(requested),
+                start_date=block_start,
+                end_date=block_end,
+                frequency=frequency,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=None,
+                panel=False,
+                fill_paused=fill_paused,
+                force_no_engine=force_no_engine,
+            )
+            frame = block.copy() if isinstance(block, pd.DataFrame) else pd.DataFrame(block)
+            if frame.empty or not {"time", "code"}.issubset(frame.columns):
+                return None
+            try:
+                import pyarrow as pa
+
+                cached = pa.Table.from_pandas(frame, preserve_index=False)
+            except ImportError:
+                cached = frame
+            if not session.set_price_block(key, cached, rows=len(frame)):
+                return None
+        except Exception:
+            session.stats.errors += 1
+            return None
+    frame = cached.to_pandas() if hasattr(cached, "to_pandas") else cached.copy()
+    frame["time"] = pd.to_datetime(frame["time"], errors="coerce")
+    sliced = frame.loc[frame["time"] <= pd.Timestamp(end_date)].copy()
+    sliced = (
+        sliced.sort_values(["code", "time"], kind="stable")
+        .groupby("code", sort=False, group_keys=False)
+        .tail(int(count))
+        .sort_values(["time", "code"], kind="stable")
+        .reset_index(drop=True)
+    )
+    if not panel:
+        return sliced
+    frames = {
+        security: sliced.loc[sliced["code"] == security]
+        .drop(columns=["time", "code"], errors="ignore")
+        .set_axis(pd.DatetimeIndex(sliced.loc[sliced["code"] == security, "time"]), axis=0)
+        for security in requested
+    }
+    return pd.concat(frames, axis=1) if frames else pd.DataFrame()
+
+
 def _try_get_price_from_backtest_session(
     *,
     security: Union[str, List[str]],
@@ -1248,6 +1378,22 @@ def _try_get_price_from_backtest_session(
         return None
     if _is_live_mode():
         return None
+    if isinstance(security, (list, tuple)) and start_date is None and count is not None:
+        if use_real_price and fq == "pre":
+            session.record_degradation("multi_price_dynamic_pre_not_cached")
+            return None
+        return _try_get_multi_price_from_backtest_session(
+            securities=security,
+            end_date=end_date,
+            frequency=frequency,
+            fields=fields,
+            skip_paused=skip_paused,
+            fq=fq,
+            count=count,
+            panel=panel,
+            fill_paused=fill_paused,
+            force_no_engine=force_no_engine,
+        )
     if not isinstance(security, str) or start_date is not None or count is None or not panel:
         session.record_degradation("price_block_unsupported_params")
         return None
@@ -1285,6 +1431,7 @@ def _try_get_price_from_backtest_session(
     )
     key = (
         "price_block",
+        _provider_dataset_identity(),
         provider_name,
         security,
         freq_key,
@@ -1616,6 +1763,89 @@ class BacktestCurrentData:
         self._context = context
         self._cache: Dict[Any, SecurityUnitData] = {}
 
+    def preload(self, securities: Sequence[str]) -> None:
+        """Batch-load one current snapshot for strategy, matching, and valuation."""
+
+        current_dt = self._context.current_dt
+        requested = list(dict.fromkeys(str(item) for item in securities))
+        missing = [item for item in requested if (item, current_dt) not in self._cache]
+        if not missing:
+            return
+        current_time = current_dt.time() if isinstance(current_dt, datetime) else None
+        current_date = current_dt.date() if isinstance(current_dt, (datetime, Date)) else None
+        use_minute = bool(current_time is not None and Time(9, 31) <= current_time < Time(15, 0))
+        use_open = bool(current_time is not None and Time(9, 25) <= current_time < Time(9, 31))
+        use_real_price = _get_setting("use_real_price")
+        force_no_engine = _get_setting("force_no_engine")
+        kwargs: Dict[str, Any] = {
+            "security": missing,
+            "end_date": current_dt,
+            "frequency": "minute" if use_minute else "daily",
+            "fields": ["open", "close", "high_limit", "low_limit", "paused"],
+            "count": 1,
+            "fq": "pre",
+            "panel": False,
+        }
+        pre_ref = _resolve_fq_ref_date(current_date or current_dt, use_real_price)
+        if pre_ref is not None:
+            kwargs.update(
+                prefer_engine=not force_no_engine,
+                pre_factor_ref_date=pre_ref,
+                force_no_engine=force_no_engine,
+            )
+        try:
+            frame = _call_provider_get_price_with_security_fallback(**kwargs)
+        except Exception as exc:
+            log.debug(f"批量预加载 current_data 失败，将按证券回退: {exc}")
+            return
+        if frame.empty or "code" not in frame.columns or "time" not in frame.columns:
+            return
+        data_session = None if _is_live_mode() else get_current_backtest_data_session()
+        for security in missing:
+            rows = frame.loc[frame["code"].astype(str) == security]
+            if rows.empty:
+                continue
+            row = rows.iloc[-1]
+            close_price = float(row["close"]) if pd.notna(row.get("close")) else 0.0
+            open_price = float(row["open"]) if "open" in row and pd.notna(row.get("open")) else None
+            high_limit = (
+                float(row.get("high_limit", 0.0)) if pd.notna(row.get("high_limit", 0.0)) else 0.0
+            )
+            low_limit = (
+                float(row.get("low_limit", 0.0)) if pd.notna(row.get("low_limit", 0.0)) else 0.0
+            )
+            row_time = pd.to_datetime(row.get("time"), errors="coerce")
+            should_use_open = bool(
+                open_price is not None
+                and use_open
+                and current_date is not None
+                and pd.notna(row_time)
+                and row_time.date() == current_date
+            )
+            last_price = open_price if should_use_open else close_price
+            high_limit, low_limit = _apply_limit_fallback(
+                security,
+                current_dt,
+                last_price,
+                high_limit,
+                low_limit,
+                use_real_price,
+                force_no_engine,
+            )
+            value = SecurityUnitData(
+                security=security,
+                last_price=last_price,
+                high_limit=high_limit,
+                low_limit=low_limit,
+                paused=bool(row.get("paused", False)),
+            )
+            self._cache[(security, current_dt)] = value
+            if data_session is not None:
+                data_session.advance_bar(current_dt)
+                data_session.set_current_bar_value(
+                    ("current_data", _provider_dataset_identity(), security, current_dt), value
+                )
+
     def __getitem__(self, security: str) -> SecurityUnitData:
         current_dt = self._context.current_dt
         cache_key = (security, current_dt)
@@ -1625,7 +1855,7 @@ class BacktestCurrentData:
         if data_session is not None:
             data_session.advance_bar(current_dt)
             session_value = data_session.get_current_bar_value(
-                ("current_data", security, current_dt)
+                ("current_data", _provider_dataset_identity(), security, current_dt)
             )
             if session_value is not None:
                 return session_value
@@ -1766,7 +1996,9 @@ class BacktestCurrentData:
 
         self._cache[cache_key] = data
         if data_session is not None:
-            data_session.set_current_bar_value(("current_data", security, current_dt), data)
+            data_session.set_current_bar_value(
+                ("current_data", _provider_dataset_identity(), security, current_dt), data
+            )
         return data
 
     def __contains__(self, security: str) -> bool:
@@ -1844,7 +2076,9 @@ class LiveCurrentData:
         else:
             if requires_live:
                 provider_name = getattr(_provider, "name", "unknown")
-                raise RuntimeError(f"数据源 {provider_name} 未返回 {security} 的实时行情，请检查行情订阅/连接")
+                raise RuntimeError(
+                    f"数据源 {provider_name} 未返回 {security} 的实时行情，请检查行情订阅/连接"
+                )
             data = self._fallback[security]
 
         self._cache[cache_key] = data
@@ -1913,7 +2147,9 @@ def _ensure_not_future_dt(value: Optional[datetime], label: str) -> Optional[dat
         return value
     current_dt = _current_context.current_dt
     if value > current_dt:
-        raise FutureDataError(f"avoid_future_data=True时，{label}({value})不能大于当前时间({current_dt})")
+        raise FutureDataError(
+            f"avoid_future_data=True时，{label}({value})不能大于当前时间({current_dt})"
+        )
     return value
 
 
@@ -1922,7 +2158,9 @@ def _ensure_not_future_date(value: Optional[Date], label: str) -> Optional[Date]
         return value
     current_date = _current_context.current_dt.date()
     if value > current_date:
-        raise FutureDataError(f"avoid_future_data=True时，{label}({value})不能大于当前日期({current_date})")
+        raise FutureDataError(
+            f"avoid_future_data=True时，{label}({value})不能大于当前日期({current_date})"
+        )
     return value
 
 
@@ -2924,7 +3162,9 @@ def get_fundamentals(
             query_object
         ):
             if _current_context.current_dt.time() < Time(15, 0):
-                raise FutureDataError("avoid_future_data=True时，回测中get_fundamentals取估值表数据需在15:00之后")
+                raise FutureDataError(
+                    "avoid_future_data=True时，回测中get_fundamentals取估值表数据需在15:00之后"
+                )
     try:
         return _provider.get_fundamentals(query_object, date=resolved_date, statDate=statDate)
     except Exception as e:
@@ -3210,7 +3450,9 @@ def get_billboard_list(
             resolved_end == _current_context.current_dt.date()
             and _current_context.current_dt.time() < Time(15, 0)
         ):
-            raise FutureDataError("avoid_future_data=True时，回测中get_billboard_list只能在收盘后获取当日数据")
+            raise FutureDataError(
+                "avoid_future_data=True时，回测中get_billboard_list只能在收盘后获取当日数据"
+            )
     try:
         return _provider.get_billboard_list(
             stock_list=stock_list,
@@ -3292,11 +3534,15 @@ def get_current_data() -> Any:
 
         return EmptyCurrentData()
 
-    return (
-        LiveCurrentData(_current_context)
-        if _should_use_live_current()
-        else BacktestCurrentData(_current_context)
-    )
+    global _current_data_container, _current_data_container_key
+    live = _should_use_live_current()
+    cache_key = (id(_current_context), getattr(_current_context, "current_dt", None), live)
+    if _current_data_container is None or _current_data_container_key != cache_key:
+        _current_data_container = (
+            LiveCurrentData(_current_context) if live else BacktestCurrentData(_current_context)
+        )
+        _current_data_container_key = cache_key
+    return _current_data_container
 
 
 def get_trade_days(

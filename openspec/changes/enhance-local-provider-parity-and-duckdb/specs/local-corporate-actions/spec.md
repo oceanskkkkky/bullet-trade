@@ -43,3 +43,16 @@ The importer SHALL retain announcement and implementation metadata needed to aud
 - **WHEN** a source row is marked cancelled or not implemented
 - **THEN** it is not returned as an executable split-dividend event
 
+### Requirement: Batch corporate-action execution path
+The local backend SHALL support one batch query for a set of securities and a date interval, while `LocalDataProvider.get_split_dividend()` SHALL retain its existing single-security public signature. The backtest engine SHALL reuse the batch result for all held securities in that trading-day evaluation.
+
+#### Scenario: Portfolio holds many dividend-paying securities
+- **WHEN** the engine evaluates corporate actions for multiple positions on one trading day
+- **THEN** it issues one native batch backend query per compatible data partition rather than one query per position
+
+### Requirement: Event-calendar cache consistency
+The backtest data session SHALL cache normalized effective events by dataset identity, security, and event date, and MUST invalidate or isolate that cache when the selected manifest generation changes.
+
+#### Scenario: Two backtests use different data generations
+- **WHEN** two backtests run against different immutable manifest identities
+- **THEN** neither run can observe corporate-action cache entries from the other generation

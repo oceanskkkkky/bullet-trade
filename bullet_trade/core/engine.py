@@ -159,6 +159,9 @@ class BacktestEngine:
         self.orders: Dict[str, Order] = {}  # 当日订单快照
         self.events = []  # 事件记录（分红/拆分）
         self._processed_dividend_keys = set()  # 已处理的分红事件键（避免重复处理）
+        self._corporate_action_calendar_cache: Dict[
+            Tuple[Any, Tuple[str, ...], date, date], Dict[str, List[Dict[str, Any]]]
+        ] = {}
         self._split_price_adjustments: Dict[Tuple[str, date], Dict[str, float]] = {}
         self.benchmark_data = None  # 基准数据
         # 新增：每日持仓快照记录
@@ -340,7 +343,9 @@ class BacktestEngine:
 
             class _TalibProxy:
                 def __getattr__(self, name):
-                    raise ImportError("TA-Lib 未安装。请先 `pip install TA-Lib` 并确保本机已安装对应的C库。")
+                    raise ImportError(
+                        "TA-Lib 未安装。请先 `pip install TA-Lib` 并确保本机已安装对应的C库。"
+                    )
 
             _talib = _TalibProxy()
 
@@ -774,6 +779,17 @@ class BacktestEngine:
 
         # 获取交易日列表（直接使用Provider，避免上下文限制导致只取到起始日）
         provider = get_data_provider()
+        preflight_backtest = getattr(provider, "preflight_backtest", None)
+        if callable(preflight_backtest):
+            configured_securities: List[str] = []
+            if isinstance(self.initial_positions, dict):
+                configured_securities = [str(code) for code in self.initial_positions]
+            preflight_backtest(
+                start_date=self.start_date,
+                end_date=self.end_date,
+                frequency=self.frequency,
+                securities=configured_securities,
+            )
         trade_days = provider.get_trade_days(start_date=self.start_date, end_date=self.end_date)
         trade_days = [pd.to_datetime(d) for d in trade_days]
         calendar_days: List[date] = [d.date() for d in trade_days]
@@ -1086,11 +1102,15 @@ class BacktestEngine:
         # 往前查 10 天，以覆盖可能因停牌延迟的分红事件
         query_start = current_date - timedelta(days=10)
 
-        for code, pos in list(portfolio.positions.items()):
+        position_items = list(portfolio.positions.items())
+        actions_by_code = self._load_corporate_actions_batch(
+            [code for code, _ in position_items],
+            start_date=query_start,
+            end_date=current_date,
+        )
+        for code, pos in position_items:
             try:
-                corp_actions = self._load_corporate_actions(
-                    code, start_date=query_start, end_date=current_date
-                )
+                corp_actions = actions_by_code.get(code, [])
                 if not corp_actions:
                     continue
 
@@ -1113,7 +1133,9 @@ class BacktestEngine:
                     )
 
                     if not self._is_action_effective_today(action, current_date):
-                        log.debug(f"{code} 分红/拆分事件: 除权日 {eff_date} 未到当日 {current_date}，跳过")
+                        log.debug(
+                            f"{code} 分红/拆分事件: 除权日 {eff_date} 未到当日 {current_date}，跳过"
+                        )
                         continue
 
                     if self._position_not_eligible_for_action(pos, eff_date):
@@ -1138,7 +1160,9 @@ class BacktestEngine:
                             continue
                         else:
                             # 除权日已过去且停牌，今天是复牌后的第一个处理机会
-                            log.info(f"{code} 除权日 {eff_date} 停牌，今日 {current_date} 执行延迟的除权事件")
+                            log.info(
+                                f"{code} 除权日 {eff_date} 停牌，今日 {current_date} 执行延迟的除权事件"
+                            )
 
                     sec_type = action.get("security_type", "stock")
                     # 内部口径：统一为 split_ratio/gross_div/base_lot
@@ -1715,6 +1739,48 @@ class BacktestEngine:
         except Exception:
             return []
 
+    def _load_corporate_actions_batch(
+        self, codes: Sequence[str], start_date: date, end_date: date
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Load one generation-isolated event calendar for all positions."""
+
+        ordered = tuple(dict.fromkeys(str(code) for code in codes))
+        if not ordered:
+            return {}
+        generation: Any = None
+        provider = None
+        try:
+            from ..data import api as data_api
+
+            provider = data_api._provider
+            diagnostics = getattr(provider, "diagnostics", None)
+            if callable(diagnostics):
+                generation = diagnostics().get("manifest_identity")
+        except Exception:
+            provider = None
+        identity = generation or (getattr(provider, "name", None), id(provider))
+        cache_key = (identity, ordered, start_date, end_date)
+        cached = self._corporate_action_calendar_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        result: Dict[str, List[Dict[str, Any]]] = {code: [] for code in ordered}
+        batch_loader = getattr(provider, "get_split_dividend_batch", None)
+        if callable(batch_loader):
+            try:
+                loaded = batch_loader(ordered, start_date=start_date, end_date=end_date)
+                for code in ordered:
+                    result[code] = list(loaded.get(code, []) or [])
+                self._corporate_action_calendar_cache[cache_key] = result
+                return result
+            except Exception as exc:
+                log.debug(f"批量加载公司行为失败，回退单证券路径: {exc}")
+        for code in ordered:
+            result[code] = self._load_corporate_actions(
+                code, start_date=start_date, end_date=end_date
+            )
+        self._corporate_action_calendar_cache[cache_key] = result
+        return result
+
     @staticmethod
     def _is_action_effective_today(action: Dict[str, Any], current_date: datetime.date) -> bool:
         """判断事件在 current_date 是否应当生效（包含等于）。"""
@@ -1850,6 +1916,9 @@ class BacktestEngine:
         from ..data.api import get_current_data
 
         current_data = get_current_data()
+        preload = getattr(current_data, "preload", None)
+        if callable(preload):
+            preload([order.security for order in orders])
 
         # 目标类订单预处理：若同一标的存在目标订单，取消其之前未完成订单，避免重复与超额
         try:
@@ -1867,7 +1936,9 @@ class BacktestEngine:
                         # 取消旧订单
                         if o.status == OrderStatus.open:
                             o.status = OrderStatus.canceled
-                            log.info(f"因目标下单，取消未完成订单: {o.security}, 订单ID {o.order_id}")
+                            log.info(
+                                f"因目标下单，取消未完成订单: {o.security}, 订单ID {o.order_id}"
+                            )
                         continue
                     new_orders.append(o)
                 orders = new_orders
@@ -1898,7 +1969,12 @@ class BacktestEngine:
 
                 # 解析执行价基准（封装逻辑便于维护与测试）
                 current_dt = self.context.current_dt
-                base_exec_price = self._resolve_base_exec_price(order.security, current_dt, fq_mode)
+                snapshot_price = float(getattr(security_data, "last_price", 0.0) or 0.0)
+                base_exec_price = (
+                    snapshot_price
+                    if snapshot_price > 0
+                    else self._resolve_base_exec_price(order.security, current_dt, fq_mode)
+                )
 
                 current_price = (
                     float(base_exec_price)
@@ -2067,7 +2143,9 @@ class BacktestEngine:
                     denom = fund_check_price * (1.0 + open_comm_rate + open_tax_rate)
                     aval_amount = int(effective_cash // denom) if denom > 0 else 0
                     if aval_amount <= 0:
-                        log.warning(f"{order.security} 资金不足，最小费用后可用现金为 {effective_cash:.2f}")
+                        log.warning(
+                            f"{order.security} 资金不足，最小费用后可用现金为 {effective_cash:.2f}"
+                        )
                         order.status = OrderStatus.rejected
                         continue
                     if aval_amount < final_amount:
@@ -2104,7 +2182,9 @@ class BacktestEngine:
                             order.status = OrderStatus.canceled
                             continue
                     else:
-                        log.debug(f"{order.security} 可卖持仓 {final_amount} 不足一手，允许碎股卖出")
+                        log.debug(
+                            f"{order.security} 可卖持仓 {final_amount} 不足一手，允许碎股卖出"
+                        )
                         final_amount = final_amount
 
                 trade_amount = final_amount
@@ -2349,30 +2429,54 @@ class BacktestEngine:
         if not self.context.portfolio.positions:
             return
 
-        for security in list(self.context.portfolio.positions.keys()):
-            try:
-                df = api_get_price(
-                    security=security,
-                    end_date=self.context.current_dt,
-                    frequency="daily",
-                    fields=["close"],
-                    count=1,
-                    fq="none",
+        securities = list(self.context.portfolio.positions.keys())
+        close_by_security: Dict[str, float] = {}
+        try:
+            batch = api_get_price(
+                security=securities,
+                end_date=self.context.current_dt,
+                frequency="daily",
+                fields=["close"],
+                count=1,
+                fq="none",
+                panel=False,
+            )
+            if not batch.empty and {"code", "close"}.issubset(batch.columns):
+                latest = (
+                    batch.sort_values("time", kind="stable").groupby("code", sort=False).tail(1)
                 )
-                if df.empty:
-                    continue
+                close_by_security = {
+                    str(row.code): float(row.close)
+                    for row in latest.itertuples(index=False)
+                    if pd.notna(row.close)
+                }
+        except Exception as exc:
+            log.debug(f"批量更新持仓价格失败，回退单证券路径: {exc}")
 
-                last_row = df.iloc[-1]
-                close_price = None
-                if "close" in df.columns:
-                    close_price = last_row["close"]
-                elif security in df.columns:
-                    close_price = last_row[security]
-                elif ("close", security) in df.columns:
-                    close_price = last_row[("close", security)]
-                else:
-                    log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
-                    continue
+        for security in securities:
+            try:
+                close_price = close_by_security.get(security)
+                if close_price is None:
+                    df = api_get_price(
+                        security=security,
+                        end_date=self.context.current_dt,
+                        frequency="daily",
+                        fields=["close"],
+                        count=1,
+                        fq="none",
+                    )
+                    if df.empty:
+                        continue
+                    last_row = df.iloc[-1]
+                    if "close" in df.columns:
+                        close_price = last_row["close"]
+                    elif security in df.columns:
+                        close_price = last_row[security]
+                    elif ("close", security) in df.columns:
+                        close_price = last_row[("close", security)]
+                    else:
+                        log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
+                        continue
 
                 if pd.notna(close_price) and close_price > 0:
                     price = self._normalize_split_day_close_price(security, float(close_price))
@@ -2659,19 +2763,21 @@ class BacktestEngine:
             "daily_records": df,
             "trades": self.trades,
             "events": self.events,
-            "daily_positions": pd.DataFrame(self.daily_positions)
-            if self.daily_positions
-            else pd.DataFrame(
-                columns=[
-                    "date",
-                    "code",
-                    "amount",
-                    "closeable_amount",
-                    "avg_cost",
-                    "acc_avg_cost",
-                    "price",
-                    "value",
-                ]
+            "daily_positions": (
+                pd.DataFrame(self.daily_positions)
+                if self.daily_positions
+                else pd.DataFrame(
+                    columns=[
+                        "date",
+                        "code",
+                        "amount",
+                        "closeable_amount",
+                        "avg_cost",
+                        "acc_avg_cost",
+                        "price",
+                        "value",
+                    ]
+                )
             ),
             "custom_plot": custom_plot_obj,
             "meta": {
