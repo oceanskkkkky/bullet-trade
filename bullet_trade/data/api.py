@@ -55,6 +55,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "rqdata"
     if lowered in ("tdx", "easytdx", "easy_tdx", "easy-tdx"):
         return "easy_tdx"
+    if lowered in ("local", "parquet", "local_parquet", "local-parquet"):
+        return "local"
     return lowered
 
 
@@ -104,6 +106,12 @@ def _create_provider(
         provider_cfg = dict(config.get("easy_tdx", {}) or {})
         provider_cfg.update(overrides)
         return EasyTdxProvider(provider_cfg)
+    if target == "local":
+        from .providers.local import LocalDataProvider
+
+        provider_cfg = dict(config.get("local", {}) or {})
+        provider_cfg.update(overrides)
+        return LocalDataProvider(provider_cfg)
 
     raise ValueError(f"未知的数据提供者: {provider_name}")
 

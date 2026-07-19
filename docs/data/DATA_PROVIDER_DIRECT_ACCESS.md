@@ -33,6 +33,7 @@ stocks = jq.get_index_stocks("399101.XSHE", date="2025-11-25")
 | tushare | `tushare.pro_api()` 客户端 → `tushare` 模块 | 需提前配置 `TUSHARE_TOKEN` |
 | qmt / miniqmt | `xtquant.xtdata` 模块 | 需安装 miniQMT/xtquant |
 | remote_qmt | 无回退 | 仅抛出缺失提示 |
+| local | 无网络回退；可通过 `.backend` 访问稳定的 `LocalDataBackend` | 保持离线回测可复现性 |
 
 回退失败会抛出类似错误：`jqdata 未实现 special_method，已尝试回退到同名 provider 的 SDK/客户端: jqdatasdk`。
 

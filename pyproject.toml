@@ -61,6 +61,9 @@ dev = [
 tushare = [
     "tushare>=1.2.0",
 ]
+local = [
+    "pyarrow>=10.0.0",
+]
 qmt = [
     "xtquant>=1.0.0",
 ]
@@ -80,7 +83,7 @@ report = [
     "snapshot-phantomjs>=0.0.3",
 ]
 all = [
-    "bullet-trade[dev,tushare,qmt,qmtserver,rqdata,tdx,report]",
+    "bullet-trade[dev,tushare,local,qmt,qmtserver,rqdata,tdx,report]",
 ]
 
 [project.urls]

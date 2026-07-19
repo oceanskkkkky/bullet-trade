@@ -174,6 +174,11 @@ def get_data_provider_config() -> dict:
             "cache_dir": cache_dir_for("tushare"),
             "tushare_custom_url": get_env("TUSHARE_CUSTOM_URL"),
         },
+        "local": {
+            "backend": get_env("LOCAL_DATA_BACKEND", "parquet"),
+            "path": get_env("LOCAL_DATA_PATH", str(Path("data") / "parquet")),
+            "strict": get_env_bool("LOCAL_DATA_STRICT", True),
+        },
         "qmt": {
             "data_dir": get_env("QMT_DATA_PATH"),
             "auto_download": get_env_optional_bool("MINIQMT_AUTO_DOWNLOAD"),

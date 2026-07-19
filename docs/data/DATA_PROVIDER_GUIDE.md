@@ -8,6 +8,7 @@
 先区分几个名字：
 
 - `qmt` / MiniQMT Provider：本地 `xtquant` / `userdata_mini` 直连数据源。
+- `local` / LocalDataProvider：只读本地 Parquet 数据湖，适合离线、可复现回测，详见 [本地 Parquet Provider](DATA_PROVIDER_LOCAL.md)。
 - 大 QMT：另一种 QMT 数据和交易后端，通过大 QMT 策略 helper 提供能力，不直接写成 `DEFAULT_DATA_PROVIDER=big_qmt`。
 - `qmt-remote` / RemoteQMT：远程客户端数据源。它是一层协议包装，底层 server 可以接 MiniQMT，也可以接大 QMT。
 

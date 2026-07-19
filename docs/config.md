@@ -140,7 +140,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | 变量 | 默认/示例 | 作用 |
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
-| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
+| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`local`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
 | `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
@@ -165,6 +165,9 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `JQDATA_CACHE_VERSION` | `2` | 缓存 schema 版本；改值可强制旧缓存失效。 |
 | `TUSHARE_TOKEN` | 空 | Tushare token。 |
 | `TUSHARE_CUSTOM_URL` | 空 | Tushare 自定义接入地址。 |
+| `LOCAL_DATA_BACKEND` | `parquet` | 本地数据存储后端；当前支持 `parquet`，接口已为 DuckDB 等后端预留。 |
+| `LOCAL_DATA_PATH` | `./data/parquet` | 本地数据根目录；相对路径按项目根目录解析，也可指向仓库外目录。 |
+| `LOCAL_DATA_STRICT` | `true` | 初始化时校验核心行情、基础信息和财务文件。 |
 | `RQDATA_LICENSE` | 空 | RQData license；配置后优先使用 license 初始化 `rqdatac`。 |
 | `RQDATA_USERNAME` / `RQDATA_PASSWORD` | 空 | RQData 用户名和密码；未配置 license 时使用。 |
 | `RQDATA_USER` / `RQDATA_PWD` | 空 | RQData 账号密码旧别名，仍兼容。 |
