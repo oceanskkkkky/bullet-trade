@@ -828,7 +828,8 @@ class LocalDataProvider(DataProvider):
             raise ValueError("count 必须为正整数")
         normalized_frequency = self._normalize_frequency(frequency)
         requested_fields: Sequence[str] = tuple(fields or self._DEFAULT_FIELDS)
-        securities = list(security) if isinstance(security, (list, tuple, set)) else [security]
+        sequence_input = isinstance(security, (list, tuple, set))
+        securities = list(security) if sequence_input else [security]
         securities = [str(item) for item in securities]
         if not securities:
             return pd.DataFrame(columns=list(requested_fields))
@@ -881,7 +882,7 @@ class LocalDataProvider(DataProvider):
                 asset_type_override=asset_types[item],
                 expected_days=shared_days,
             )
-        if len(frames) == 1:
+        if len(frames) == 1 and not sequence_input:
             return next(iter(frames.values()))
         if panel:
             return pd.concat(frames, axis=1)
@@ -1260,32 +1261,45 @@ class LocalDataProvider(DataProvider):
         last_day = pd.Timestamp(trade_days[-1]).normalize()
         normalized_frequency = self._normalize_frequency(frequency)
         requested = [str(item) for item in (securities or ())]
-        required_datasets = {"stock_basic", "stock_daily"}
-        bar_datasets = {"stock_daily"}
-        if normalized_frequency != "1d":
-            minute_dataset = "stock_{}".format(normalized_frequency)
-            required_datasets.add(minute_dataset)
-            bar_datasets.add(minute_dataset)
-        if self._as_bool(self.config.get("require_corporate_actions"), True):
+        resolved_assets: Dict[str, AssetType] = {}
+        for security in requested:
+            ts_code = self._to_ts_code(security)
+            try:
+                resolved_assets[ts_code] = self._backend.asset_type(ts_code)
+            except Exception as exc:
+                raise LocalDataConfigurationError(
+                    "本地回测预检无法识别证券 {!r}；请补齐对应 basic 数据或修正代码后缀".format(
+                        security
+                    )
+                ) from exc
+
+        # When no universe is declared, retain the historical stock probe. If
+        # securities are supplied, requirements must reflect their real assets.
+        preflight_assets = set(resolved_assets.values()) or {AssetType.STOCK}
+        required_datasets = set()
+        bar_datasets = set()
+        for asset_type in preflight_assets:
+            basic_dataset = "{}_basic".format(asset_type.value)
+            bar_dataset = (
+                "{}_daily".format(asset_type.value)
+                if normalized_frequency == "1d"
+                else "{}_{}".format(asset_type.value, normalized_frequency)
+            )
+            required_datasets.update((basic_dataset, bar_dataset))
+            bar_datasets.add(bar_dataset)
+
+        require_actions = self._as_bool(self.config.get("require_corporate_actions"), True)
+        require_actions = require_actions and any(
+            asset_type in (AssetType.STOCK, AssetType.FUND) for asset_type in preflight_assets
+        )
+        if require_actions:
             required_datasets.add("corporate_actions")
         if self._as_bool(self.config.get("require_fundamentals"), False):
             required_datasets.update(("income", "balance", "cash_flow", "indicator"))
 
         manifest = getattr(self._backend, "manifest", None)
+        security_coverage: Dict[str, Dict[str, str]] = {}
         if manifest is not None:
-            for security in requested:
-                asset_type = self._backend.asset_type(self._to_ts_code(security))
-                dataset = (
-                    {
-                        AssetType.STOCK: "stock_daily",
-                        AssetType.FUND: "fund_daily",
-                        AssetType.INDEX: "index_daily",
-                    }[asset_type]
-                    if normalized_frequency == "1d"
-                    else "{}_{}".format(asset_type.value, normalized_frequency)
-                )
-                required_datasets.add(dataset)
-                bar_datasets.add(dataset)
             for dataset in sorted(required_datasets):
                 manifest.dataset_shards(dataset) or manifest.dataset_shard(dataset)
             for dataset in sorted(bar_datasets):
@@ -1306,11 +1320,91 @@ class LocalDataProvider(DataProvider):
                             dataset, first_day.date(), last_day.date()
                         )
                     )
-        elif "corporate_actions" in required_datasets:
-            catalog = self._backend.read_securities((AssetType.STOCK,), first_day)
-            if catalog.empty:
+        else:
+            for ts_code, asset_type in resolved_assets.items():
+                catalog = self._backend.read_securities((asset_type,))
+                if ts_code not in catalog.index:
+                    raise LocalDataConfigurationError(
+                        "本地回测预检在 {}_basic 中找不到证券 {}".format(
+                            asset_type.value, self._to_jq_code(ts_code)
+                        )
+                    )
+                metadata = catalog.loc[ts_code]
+                listed_at = pd.to_datetime(metadata.get("start_date"), errors="coerce")
+                delisted_at = pd.to_datetime(metadata.get("end_date"), errors="coerce")
+                expected_start = (
+                    max(first_day, listed_at.normalize()) if pd.notna(listed_at) else first_day
+                )
+                expected_end = (
+                    min(last_day, delisted_at.normalize()) if pd.notna(delisted_at) else last_day
+                )
+                if expected_start > expected_end:
+                    raise LocalDataConfigurationError(
+                        "证券 {} 在回测区间 {}..{} 内未上市或已退市".format(
+                            self._to_jq_code(ts_code), first_day.date(), last_day.date()
+                        )
+                    )
+                try:
+                    bars = self._backend.read_bars(
+                        BarRequest(
+                            security=ts_code,
+                            asset_type=asset_type,
+                            frequency=normalized_frequency,
+                            start=expected_start,
+                            end=expected_end + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1),
+                            columns=("close",),
+                        )
+                    )
+                except Exception as exc:
+                    dataset = (
+                        "{}_daily".format(asset_type.value)
+                        if normalized_frequency == "1d"
+                        else "{}_{}".format(asset_type.value, normalized_frequency)
+                    )
+                    raise LocalDataConfigurationError(
+                        "本地回测预检无法读取数据集 {} 中证券 {} 的行情".format(
+                            dataset, self._to_jq_code(ts_code)
+                        )
+                    ) from exc
+                if bars.empty or "time" not in bars:
+                    dataset = (
+                        "{}_daily".format(asset_type.value)
+                        if normalized_frequency == "1d"
+                        else "{}_{}".format(asset_type.value, normalized_frequency)
+                    )
+                    raise LocalDataConfigurationError(
+                        "本地数据集 {} 在 {}..{} 内没有证券 {} 的行情".format(
+                            dataset,
+                            expected_start.date(),
+                            expected_end.date(),
+                            self._to_jq_code(ts_code),
+                        )
+                    )
+                bar_times = pd.to_datetime(bars["time"], errors="coerce").dropna()
+                security_coverage[self._to_jq_code(ts_code)] = {
+                    "asset_type": asset_type.value,
+                    "min": str(bar_times.min()),
+                    "max": str(bar_times.max()),
+                }
+
+        if require_actions and manifest is None:
+            probe_security = next(
+                (
+                    code
+                    for code, asset_type in resolved_assets.items()
+                    if asset_type in (AssetType.STOCK, AssetType.FUND)
+                ),
+                None,
+            )
+            if probe_security is None:
+                catalog = self._backend.read_securities((AssetType.STOCK,), first_day)
+            else:
+                catalog = None
+            if catalog is not None and catalog.empty:
                 raise LocalDataConfigurationError("本地回测预检无法找到股票基础信息")
-            probe_security = str(catalog.index[0])
+            if catalog is not None:
+                probe_security = str(catalog.index[0])
+            assert probe_security is not None
             try:
                 self._backend.read_corporate_actions(probe_security, first_day, last_day)
             except Exception as exc:
@@ -1325,6 +1419,7 @@ class LocalDataProvider(DataProvider):
             "first_trade_day": str(first_day.date()),
             "last_trade_day": str(last_day.date()),
             "required_datasets": sorted(required_datasets),
+            "security_coverage": security_coverage,
             "manifest_identity": self._backend.diagnostics().get("manifest_identity"),
         }
 

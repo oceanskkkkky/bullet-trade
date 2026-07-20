@@ -303,6 +303,17 @@ def test_local_provider_adjustment_and_multi_security_long_shape(local_root: Pat
     assert list(long_frame.columns) == ["time", "code", "close"]
     assert set(long_frame["code"]) == {"000001.XSHE", "510300.XSHG"}
 
+    single_long_frame = provider.get_price(
+        ["510300.XSHG"],
+        start_date="2025-01-02",
+        end_date="2025-01-02",
+        fields=["money"],
+        fq=None,
+        panel=False,
+    )
+    assert list(single_long_frame.columns) == ["time", "code", "money"]
+    assert single_long_frame.iloc[0]["code"] == "510300.XSHG"
+
 
 def test_local_provider_reads_historical_index_components(local_root: Path) -> None:
     provider = LocalDataProvider({"path": str(local_root)})
@@ -757,6 +768,75 @@ def test_local_backtest_preflight_accepts_canonical_actions(local_root: Path) ->
     )
 
     assert "corporate_actions" in report["required_datasets"]
+
+
+def test_local_backtest_preflight_uses_requested_asset_datasets(local_root: Path) -> None:
+    provider = LocalDataProvider({"path": str(local_root), "require_corporate_actions": False})
+
+    report = provider.preflight_backtest(
+        start_date="2025-01-02",
+        end_date="2025-01-06",
+        frequency="daily",
+        securities=["510300.XSHG", "000001.XSHG"],
+    )
+
+    assert report["required_datasets"] == [
+        "fund_basic",
+        "fund_daily",
+        "index_basic",
+        "index_daily",
+    ]
+    assert set(report["security_coverage"]) == {"510300.XSHG", "000001.XSHG"}
+    assert report["security_coverage"]["510300.XSHG"]["asset_type"] == "fund"
+    assert report["security_coverage"]["000001.XSHG"]["asset_type"] == "index"
+
+
+def test_local_backtest_preflight_reports_missing_requested_asset_frequency(
+    local_root: Path,
+) -> None:
+    provider = LocalDataProvider({"path": str(local_root), "require_corporate_actions": False})
+
+    with pytest.raises(LocalDataConfigurationError, match="fund_1m.*510300.XSHG"):
+        provider.preflight_backtest(
+            start_date="2025-01-02",
+            end_date="2025-01-06",
+            frequency="minute",
+            securities=["510300.XSHG"],
+        )
+
+
+def test_local_security_metadata_drives_fund_settlement_rules(local_root: Path) -> None:
+    provider = LocalDataProvider({"path": str(local_root)})
+    base_info = provider.get_security_info("510300.XSHG")
+    assert base_info["etf_type"] == "股票型"
+
+    data_api.reset_security_overrides()
+    try:
+        domestic = data_api._merge_overrides(
+            "510300.XSHG",
+            {"type": "fund", "display_name": "沪深300ETF", "etf_type": "纯境内"},
+        )
+        qdii = data_api._merge_overrides(
+            "513999.XSHG",
+            {"type": "fund", "display_name": "海外ETF", "etf_type": "QDII"},
+        )
+        bond = data_api._merge_overrides(
+            "511999.XSHG",
+            {"type": "fund", "display_name": "国债ETF", "etf_type": "纯境内"},
+        )
+        money_market = data_api._merge_overrides(
+            "511998.XSHG",
+            {"type": "fund", "display_name": "现金ETF", "etf_type": "纯境内"},
+        )
+    finally:
+        data_api.reset_security_overrides()
+
+    assert domestic["tplus"] == 1
+    assert qdii["tplus"] == 0
+    assert qdii["subtype"] == "qdii"
+    assert bond["tplus"] == 0
+    assert money_market["tplus"] == 0
+    assert money_market["category"] == "money_market_fund"
 
 
 def test_tushare_corporate_action_normalizers() -> None:
@@ -1441,6 +1521,27 @@ def test_duckdb_backtest_preflight_rejects_missing_frequency_shard(
     with pytest.raises(LocalDataMissingShardError, match="stock_1m"):
         provider.preflight_backtest(
             start_date="2025-01-02", end_date="2025-01-06", frequency="minute"
+        )
+
+
+def test_duckdb_backtest_preflight_uses_requested_fund_frequency_shard(
+    duckdb_generation,
+) -> None:
+    _, pointer, _, _ = duckdb_generation
+    provider = LocalDataProvider(
+        {
+            "backend": "duckdb",
+            "path": str(pointer),
+            "require_corporate_actions": False,
+        }
+    )
+
+    with pytest.raises(LocalDataMissingShardError, match="fund_1m"):
+        provider.preflight_backtest(
+            start_date="2025-01-02",
+            end_date="2025-01-06",
+            frequency="minute",
+            securities=["510300.XSHG"],
         )
 
 

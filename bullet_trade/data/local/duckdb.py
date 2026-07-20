@@ -406,14 +406,16 @@ class DuckDBDataBackend(LocalDataBackend):
         catalogs = self._load_catalogs()
         frames = [catalogs[asset].copy() for asset in asset_types]
         if not frames:
-            return pd.DataFrame(columns=("display_name", "name", "start_date", "end_date", "type"))
+            return pd.DataFrame(
+                columns=("display_name", "name", "start_date", "end_date", "type", "etf_type")
+            )
         frame = pd.concat(frames, axis=0)
         if date is not None:
             frame = frame[
                 (frame["start_date"].fillna(pd.Timestamp.min) <= date)
                 & (frame["end_date"].fillna(pd.Timestamp.max) >= date)
             ]
-        columns = ("display_name", "name", "start_date", "end_date", "type")
+        columns = ("display_name", "name", "start_date", "end_date", "type", "etf_type")
         return frame[[column for column in columns if column in frame]].copy()
 
     def read_security_info_batch(self, request: SecurityInfoRequest) -> pd.DataFrame:

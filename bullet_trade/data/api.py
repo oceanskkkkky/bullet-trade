@@ -475,11 +475,31 @@ def _merge_overrides(security: str, base_info: Dict[str, Any]) -> Dict[str, Any]
     by_prefix = _security_overrides.get("by_prefix") or {}
 
     out = dict(base_info)
+    primary = str(out.get("type") or "").lower()
+
+    # Tushare 的 ETF 基础信息会标记 QDII。该元数据比代码前缀更稳定，
+    # 可用于区分可日内回转的跨境基金与普通境内股票 ETF。
+    etf_type = str(out.get("etf_type") or "").strip().upper()
+    if etf_type == "QDII":
+        out.setdefault("subtype", "qdii")
+        out.setdefault("tplus", 0)
+
+    # Tushare currently does not expose a dedicated settlement-cycle field.
+    # For domestic funds, use conservative product-name semantics for the
+    # exchange-traded T+0 classes; ordinary equity ETFs remain T+1 by default.
+    display_name = str(out.get("display_name") or out.get("name") or "")
+    money_market_markers = ("货币", "现金", "保证金", "日利", "快钱")
+    t0_fund_markers = ("债", "转债", "黄金", "商品", "豆粕", "能源化工", "有色")
+    if primary in ("fund", "etf"):
+        if any(marker in display_name for marker in money_market_markers):
+            out.setdefault("category", "money_market_fund")
+            out.setdefault("tplus", 0)
+        elif any(marker in display_name for marker in t0_fund_markers):
+            out.setdefault("tplus", 0)
 
     # 推断分类
     category = out.get("category")
     subtype = str(out.get("subtype") or "").lower()
-    primary = str(out.get("type") or "").lower()
     if not category:
         if subtype in ("mmf", "money_market_fund"):
             category = "money_market_fund"

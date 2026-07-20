@@ -45,7 +45,7 @@
 
   "by_category": {
     "money_market_fund": { "tplus": 0, "slippage": 0.0, "tick_decimals": 3 },
-    "fund":              { "tplus": 0, "slippage": 0.00246, "tick_decimals": 3 },
+    "fund":              { "tplus": 1, "slippage": 0.00246, "tick_decimals": 3 },
     "stock":             { "tplus": 1, "slippage": 0.00246, "tick_decimals": 2 }
   },
 

@@ -448,13 +448,15 @@ class ParquetDataBackend(LocalDataBackend):
         catalogs = self._load_catalogs()
         frames = [catalogs[asset].copy() for asset in asset_types]
         if not frames:
-            return pd.DataFrame(columns=("display_name", "name", "start_date", "end_date", "type"))
+            return pd.DataFrame(
+                columns=("display_name", "name", "start_date", "end_date", "type", "etf_type")
+            )
         frame = pd.concat(frames, axis=0)
         if date is not None:
             start = frame["start_date"].fillna(pd.Timestamp.min)
             end = frame["end_date"].fillna(pd.Timestamp.max)
             frame = frame[(start <= date) & (end >= date)]
-        columns = ("display_name", "name", "start_date", "end_date", "type")
+        columns = ("display_name", "name", "start_date", "end_date", "type", "etf_type")
         return frame[[column for column in columns if column in frame.columns]].copy()
 
     def read_index_components(
